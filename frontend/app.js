@@ -11,6 +11,9 @@ const title = document.querySelector("#title");
 const thumbnail = document.querySelector("#thumbnail");
 const details = document.querySelector("#details");
 const formats = document.querySelector("#formats");
+const progressSection = document.querySelector("#download-progress");
+const progressFill = document.querySelector("#progress-fill");
+const progressLabel = document.querySelector("#progress-label");
 
 let currentUrl = "";
 
@@ -36,6 +39,33 @@ function formatDuration(seconds) {
   const minutes = Math.floor(seconds / 60);
   const remaining = Math.floor(seconds % 60).toString().padStart(2, "0");
   return `${minutes}:${remaining}`;
+}
+
+function formatSpeed(bytesPerSecond) {
+  if (!bytesPerSecond) return "";
+  return `${formatBytes(bytesPerSecond)}/s`;
+}
+
+function setProgress(job) {
+  progressSection.hidden = false;
+  progressFill.style.width = `${job.progress || 0}%`;
+  if (job.state === "preparing") {
+    progressLabel.textContent = "Preparing download...";
+  } else if (job.state === "processing") {
+    progressLabel.textContent = "Merging video and audio...";
+  } else if (job.state === "downloading") {
+    const transferred = formatBytes(job.downloaded_bytes);
+    const total = job.total_bytes ? ` of ${formatBytes(job.total_bytes)}` : "";
+    const speed = formatSpeed(job.speed);
+    const eta = job.eta ? ` · about ${job.eta}s left` : "";
+    progressLabel.textContent = `${Math.round(job.progress)}% · ${transferred}${total}${speed ? ` · ${speed}` : ""}${eta}`;
+  } else if (job.state === "ready") {
+    progressLabel.textContent = "Ready. Starting browser download...";
+  }
+}
+
+function wait(milliseconds) {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
 }
 
 function showFormats(video) {
@@ -65,16 +95,35 @@ function showFormats(video) {
 async function downloadFormat(format, button) {
   document.querySelectorAll(".format-button").forEach((item) => (item.disabled = true));
   button.classList.add("loading");
-  setMessage("Preparing your download. This can take a moment.");
+  progressSection.hidden = true;
+  setMessage("");
 
   try {
+    const response = await fetch(apiUrl("/api/jobs"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: currentUrl, format_id: format.id }),
+    });
+    const createdJob = await response.json();
+    if (!response.ok) throw new Error(createdJob.detail || "Could not start the download.");
+
+    let job = createdJob;
+    while (job.state !== "ready" && job.state !== "failed") {
+      setProgress(job);
+      await wait(900);
+      const jobResponse = await fetch(apiUrl(`/api/jobs/${job.id}`));
+      job = await jobResponse.json();
+      if (!jobResponse.ok) throw new Error(job.detail || "The download expired.");
+    }
+    if (job.state === "failed") throw new Error(job.error || "Download failed. Try another format.");
+
+    setProgress(job);
     const link = document.createElement("a");
-    const params = new URLSearchParams({ url: currentUrl, format_id: format.id });
-    link.href = apiUrl(`/api/download?${params.toString()}`);
+    link.href = apiUrl(`/api/jobs/${job.id}/file`);
     document.body.append(link);
     link.click();
     link.remove();
-    setMessage("Your browser will start the download when it is ready.");
+    setMessage("Your browser download has started.");
   } finally {
     button.classList.remove("loading");
     document.querySelectorAll(".format-button").forEach((item) => (item.disabled = false));
@@ -89,6 +138,7 @@ form.addEventListener("submit", async (event) => {
   currentUrl = url;
   inspectButton.disabled = true;
   result.hidden = true;
+  progressSection.hidden = true;
   setMessage("Looking for available formats...");
 
   try {

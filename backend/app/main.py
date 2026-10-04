@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass, field
 import ipaddress
 import logging
 import os
@@ -10,9 +11,12 @@ import re
 import shutil
 import socket
 import tempfile
+import threading
+from time import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+from uuid import uuid4
 
 import yt_dlp
 from fastapi import BackgroundTasks, FastAPI, HTTPException
@@ -25,6 +29,7 @@ MAX_URL_LENGTH = 2_000
 VIDEO_EXTENSIONS = {".mp4", ".webm", ".mkv", ".mov", ".m4v", ".avi"}
 SAFE_FILENAME = re.compile(r"[^A-Za-z0-9._ -]+")
 logger = logging.getLogger(__name__)
+JOB_TTL_SECONDS = 15 * 60
 
 app = FastAPI(title="Video Downloader API", version="0.1.0")
 
@@ -43,6 +48,30 @@ app.add_middleware(
 
 class VideoRequest(BaseModel):
     url: HttpUrl
+
+
+class DownloadRequest(VideoRequest):
+    format_id: str
+
+
+@dataclass
+class DownloadJob:
+    id: str
+    directory: str
+    state: str = "queued"
+    progress: float = 0
+    downloaded_bytes: int = 0
+    total_bytes: int | None = None
+    speed: float | None = None
+    eta: int | None = None
+    error: str | None = None
+    file: Path | None = None
+    filename: str | None = None
+    created_at: float = field(default_factory=time)
+
+
+jobs: dict[str, DownloadJob] = {}
+jobs_lock = threading.Lock()
 
 
 def _is_public_url(value: str) -> bool:
@@ -161,7 +190,7 @@ async def inspect_video(request: VideoRequest) -> dict[str, Any]:
         raise HTTPException(status_code=422, detail="Could not inspect this video. It may be unavailable or unsupported.") from error
 
 
-def _download(url: str, format_id: str, directory: str) -> tuple[Path, str]:
+def _download(url: str, format_id: str, directory: str, progress_hook: Any | None = None) -> tuple[Path, str]:
     info = _extract_info(url)
     available_ids = {str(item.get("format_id")) for item in info.get("formats", [])}
     if format_id not in available_ids:
@@ -175,6 +204,8 @@ def _download(url: str, format_id: str, directory: str) -> tuple[Path, str]:
         "max_filesize": MAX_FILE_BYTES,
         "restrictfilenames": True,
     }
+    if progress_hook:
+        options["progress_hooks"] = [progress_hook]
     with yt_dlp.YoutubeDL(options) as ydl:
         ydl.download([url])
 
@@ -186,6 +217,105 @@ def _download(url: str, format_id: str, directory: str) -> tuple[Path, str]:
         raise ValueError("This video exceeds the 500 MB limit.")
     title = SAFE_FILENAME.sub("", info.get("title") or "video").strip(" .") or "video"
     return file, f"{title[:120]}{file.suffix.lower()}"
+
+
+def _job_payload(job: DownloadJob) -> dict[str, Any]:
+    return {
+        "id": job.id,
+        "state": job.state,
+        "progress": round(job.progress, 1),
+        "downloaded_bytes": job.downloaded_bytes,
+        "total_bytes": job.total_bytes,
+        "speed": job.speed,
+        "eta": job.eta,
+        "error": job.error,
+    }
+
+
+def _update_job(job_id: str, **values: Any) -> None:
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if job:
+            for key, value in values.items():
+                setattr(job, key, value)
+
+
+def _remove_job(job_id: str, directory: str) -> None:
+    with jobs_lock:
+        jobs.pop(job_id, None)
+    shutil.rmtree(directory, ignore_errors=True)
+
+
+async def _run_download_job(job_id: str, url: str, format_id: str, directory: str) -> None:
+    def progress_hook(data: dict[str, Any]) -> None:
+        status = data.get("status")
+        if status == "downloading":
+            downloaded = data.get("downloaded_bytes") or 0
+            total = data.get("total_bytes") or data.get("total_bytes_estimate")
+            progress = (downloaded / total * 100) if total else 0
+            _update_job(
+                job_id,
+                state="downloading",
+                progress=min(progress, 99.9),
+                downloaded_bytes=downloaded,
+                total_bytes=total,
+                speed=data.get("speed"),
+                eta=data.get("eta"),
+            )
+        elif status == "finished":
+            _update_job(job_id, state="processing", progress=100, eta=None)
+
+    try:
+        _update_job(job_id, state="preparing")
+        file, filename = await asyncio.to_thread(_download, url, format_id, directory, progress_hook)
+    except Exception:
+        logger.exception("Background video download failed")
+        _update_job(job_id, state="failed", error="Could not download this format. Please try another one.")
+        await asyncio.sleep(JOB_TTL_SECONDS)
+        _remove_job(job_id, directory)
+        return
+
+    _update_job(job_id, state="ready", progress=100, file=file, filename=filename, eta=None)
+    await asyncio.sleep(JOB_TTL_SECONDS)
+    with jobs_lock:
+        should_expire = job_id in jobs and jobs[job_id].state == "ready"
+    if should_expire:
+        _remove_job(job_id, directory)
+
+
+@app.post("/api/jobs")
+async def create_download_job(request: DownloadRequest) -> dict[str, Any]:
+    url = str(request.url)
+    _validate_url(url)
+    directory = tempfile.mkdtemp(prefix="video-download-")
+    job = DownloadJob(id=uuid4().hex, directory=directory)
+    with jobs_lock:
+        jobs[job.id] = job
+    asyncio.create_task(_run_download_job(job.id, url, request.format_id, directory))
+    return _job_payload(job)
+
+
+@app.get("/api/jobs/{job_id}")
+async def get_download_job(job_id: str) -> dict[str, Any]:
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="This download has expired. Start it again.")
+        return _job_payload(job)
+
+
+@app.get("/api/jobs/{job_id}/file")
+async def get_download_file(job_id: str, background_tasks: BackgroundTasks) -> FileResponse:
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="This download has expired. Start it again.")
+        if job.state != "ready" or not job.file or not job.filename:
+            raise HTTPException(status_code=409, detail="This download is not ready yet.")
+        file, filename, directory = job.file, job.filename, job.directory
+
+    background_tasks.add_task(_remove_job, job_id, directory)
+    return FileResponse(file, media_type="application/octet-stream", filename=filename, background=background_tasks)
 
 
 @app.get("/api/download")

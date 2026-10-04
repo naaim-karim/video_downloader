@@ -42,6 +42,10 @@ button { cursor: pointer; border: 0; border-radius: 9px; padding: 13px 17px; fon
 button:disabled { cursor: wait; opacity: .6; }
 .message { min-height: 24px; margin: 18px 0 0; color: #52524d; }
 .message.error { color: #b42318; }
+.download-progress { margin-top: 18px; }
+.progress-track { height: 9px; overflow: hidden; background: #e6e6e0; border-radius: 999px; }
+.progress-fill { width: 0; height: 100%; background: #1468b8; border-radius: inherit; transition: width .25s ease; }
+.download-progress p { margin: 9px 0 0; color: #52524d; font-size: .88rem; }
 .result { margin-top: 22px; }
 .video-summary { display: flex; gap: 15px; align-items: center; padding-bottom: 20px; border-bottom: 1px solid #e6e6e0; }
 .video-summary img { width: 144px; height: 81px; object-fit: cover; border-radius: 7px; background: #eee; }
