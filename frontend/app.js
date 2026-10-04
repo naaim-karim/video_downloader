@@ -30,8 +30,17 @@ function setMessage(text, isError = false) {
 }
 
 function formatBytes(bytes) {
-  if (!bytes) return "Size unknown";
+  if (!bytes || bytes < 0) return "Size not provided";
   return `${(bytes / 1024 / 1024).toFixed(bytes > 100 * 1024 * 1024 ? 0 : 1)} MB`;
+}
+
+function isYouTubeUrl(value) {
+  try {
+    const hostname = new URL(value).hostname.toLowerCase().replace(/\.$/, "");
+    return hostname === "youtu.be" || hostname === "youtube.com" || hostname.endsWith(".youtube.com");
+  } catch {
+    return false;
+  }
 }
 
 function formatDuration(seconds) {
@@ -85,7 +94,8 @@ function showFormats(video) {
     button.type = "button";
     button.className = "format-button";
     const audioText = format.has_audio ? "audio included" : "audio merged";
-    button.innerHTML = `<strong>${format.label}</strong><span>${format.width} × ${format.height} · ${format.orientation} · ${format.ext.toUpperCase()}</span><small>${audioText} · ${formatBytes(format.filesize)}</small>`;
+    const sizeText = format.filesize_estimated ? `about ${formatBytes(format.filesize)}` : formatBytes(format.filesize);
+    button.innerHTML = `<strong>${format.label}</strong><span>${format.width} × ${format.height} · ${format.orientation} · ${format.ext.toUpperCase()}</span><small>${audioText} · ${sizeText}</small>`;
     button.addEventListener("click", () => downloadFormat(format, button));
     formats.append(button);
   }
@@ -134,6 +144,13 @@ form.addEventListener("submit", async (event) => {
   event.preventDefault();
   const url = input.value.trim();
   if (!url) return;
+
+  if (isYouTubeUrl(url)) {
+    result.hidden = true;
+    progressSection.hidden = true;
+    setMessage("YouTube downloads are unavailable because YouTube's Terms do not allow this type of download.", true);
+    return;
+  }
 
   currentUrl = url;
   inspectButton.disabled = true;

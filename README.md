@@ -50,5 +50,6 @@ The free Render service may take about a minute to wake after 15 minutes without
 ## Notes
 
 - A given site may block automated access, require login, or have no downloadable formats.
-- High quality formats commonly need FFmpeg to combine separate video and audio streams. The Docker image also includes Deno and `yt-dlp-ejs`, which yt-dlp requires for full YouTube support.
+- High quality formats commonly need FFmpeg to combine separate video and audio streams.
+- YouTube URLs are not supported because YouTube's Terms restrict this type of download.
 - Use this only for videos you own or are permitted to download.

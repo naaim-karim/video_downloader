@@ -11,12 +11,12 @@
     <main class="page">
       <section class="card">
         <h1>Video Downloader</h1>
-        <p class="intro">Paste a public video URL, select a quality, and download it.</p>
+        <p class="intro">Paste a supported public video URL, select a quality, and download it.</p>
 
         <form id="inspect-form" novalidate>
           <label for="video-url">Video URL</label>
           <div class="url-row">
-            <input id="video-url" name="url" type="url" placeholder="https://www.youtube.com/watch?v=..." required />
+            <input id="video-url" name="url" type="url" placeholder="https://example.com/video" required />
             <button id="inspect-button" type="submit">Find video</button>
           </div>
         </form>
@@ -37,7 +37,7 @@
           <div id="formats" class="formats" aria-label="Available download formats"></div>
         </section>
 
-        <p class="notice">Download only videos you own or have permission to save.</p>
+        <p class="notice">YouTube downloads are unavailable because YouTube's Terms do not allow this type of download. Download only videos you own or have permission to save.</p>
       </section>
     </main>
     <script src="config.js"></script>

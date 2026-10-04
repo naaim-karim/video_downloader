@@ -1,5 +1,4 @@
 fastapi>=0.115,<1
 uvicorn[standard]>=0.30,<1
-# `default` includes yt-dlp-ejs, required for full YouTube support.
 # Extractors change frequently; keep this current when building the image.
-yt-dlp[default]
+yt-dlp

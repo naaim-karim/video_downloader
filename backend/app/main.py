@@ -98,6 +98,12 @@ def _is_public_url(value: str) -> bool:
 
 
 def _validate_url(url: str) -> None:
+    hostname = (urlparse(url).hostname or "").lower().rstrip(".")
+    if hostname == "youtu.be" or hostname == "youtube.com" or hostname.endswith(".youtube.com"):
+        raise HTTPException(
+            status_code=400,
+            detail="YouTube downloads are unavailable because YouTube's Terms do not allow this type of download.",
+        )
     if len(url) > MAX_URL_LENGTH or not _is_public_url(url):
         raise HTTPException(status_code=400, detail="Enter a public HTTP or HTTPS video URL.")
 
@@ -119,8 +125,31 @@ def _extract_info(url: str) -> dict[str, Any]:
         return ydl.extract_info(url, download=False)
 
 
+def _format_size(item: dict[str, Any], duration: float | int | None) -> tuple[int | None, bool]:
+    """Return a format's advertised size, or a bitrate-based estimate."""
+    size = item.get("filesize")
+    if size:
+        return int(size), False
+    size = item.get("filesize_approx")
+    if size:
+        return int(size), True
+    bitrate = item.get("tbr")
+    if duration and bitrate:
+        return int(float(duration) * float(bitrate) * 125), True
+    return None, False
+
+
 def _public_formats(info: dict[str, Any]) -> list[dict[str, Any]]:
     formats: list[dict[str, Any]] = []
+    duration = info.get("duration")
+    audio_formats = [
+        item
+        for item in info.get("formats", [])
+        if item.get("vcodec") in {None, "none"} and item.get("acodec") not in {None, "none"}
+    ]
+    best_audio = max(audio_formats, key=lambda item: item.get("abr") or item.get("tbr") or 0, default=None)
+    best_audio_size, best_audio_is_estimate = _format_size(best_audio, duration) if best_audio else (None, False)
+
     for item in info.get("formats", []):
         if item.get("vcodec") in {None, "none"}:
             continue
@@ -130,7 +159,11 @@ def _public_formats(info: dict[str, Any]) -> list[dict[str, Any]]:
         width, height = item.get("width"), item.get("height")
         if not width or not height:
             continue
-        size = item.get("filesize") or item.get("filesize_approx")
+        size, size_is_estimate = _format_size(item, duration)
+        has_audio = item.get("acodec") not in {None, "none"}
+        if not has_audio and best_audio_size:
+            size = (size or 0) + best_audio_size
+            size_is_estimate = size_is_estimate or best_audio_is_estimate or not item.get("filesize")
         if size and size > MAX_FILE_BYTES:
             continue
         formats.append(
@@ -142,7 +175,8 @@ def _public_formats(info: dict[str, Any]) -> list[dict[str, Any]]:
                 "fps": item.get("fps"),
                 "ext": item.get("ext") or "video",
                 "filesize": size,
-                "has_audio": item.get("acodec") not in {None, "none"},
+                "filesize_estimated": size_is_estimate,
+                "has_audio": has_audio,
                 "orientation": "portrait" if height > width else "landscape",
             }
         )
