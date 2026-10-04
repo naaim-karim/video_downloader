@@ -30,7 +30,7 @@ function setMessage(text, isError = false) {
 }
 
 function formatBytes(bytes) {
-  if (!bytes || bytes < 0) return "Size not provided";
+  if (!bytes || bytes < 0) return "Size calculated during download";
   return `${(bytes / 1024 / 1024).toFixed(bytes > 100 * 1024 * 1024 ? 0 : 1)} MB`;
 }
 

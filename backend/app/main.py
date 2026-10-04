@@ -16,6 +16,7 @@ from time import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 from uuid import uuid4
 
 import yt_dlp
@@ -125,6 +126,32 @@ def _extract_info(url: str) -> dict[str, Any]:
         return ydl.extract_info(url, download=False)
 
 
+def _content_length(headers: Any) -> int | None:
+    content_range = headers.get("Content-Range")
+    if content_range:
+        match = re.search(r"/(\d+)$", content_range)
+        if match:
+            return int(match.group(1))
+    content_length = headers.get("Content-Length")
+    return int(content_length) if content_length and content_length.isdigit() else None
+
+
+def _remote_format_size(item: dict[str, Any]) -> int | None:
+    """Request a single byte to read a media server's declared file size."""
+    media_url = item.get("url")
+    if not media_url or not _is_public_url(media_url):
+        return None
+    headers = {"User-Agent": "Mozilla/5.0"}
+    headers.update(item.get("http_headers") or {})
+    headers["Range"] = "bytes=0-0"
+    try:
+        request = Request(media_url, headers=headers)
+        with urlopen(request, timeout=4) as response:
+            return _content_length(response.headers)
+    except Exception:
+        return None
+
+
 def _format_size(item: dict[str, Any], duration: float | int | None) -> tuple[int | None, bool]:
     """Return a format's advertised size, or a bitrate-based estimate."""
     size = item.get("filesize")
@@ -139,6 +166,14 @@ def _format_size(item: dict[str, Any], duration: float | int | None) -> tuple[in
     return None, False
 
 
+def _resolved_format_size(item: dict[str, Any], duration: float | int | None) -> tuple[int | None, bool]:
+    size, is_estimate = _format_size(item, duration)
+    if size is not None:
+        return size, is_estimate
+    size = _remote_format_size(item)
+    return (size, False) if size is not None else (None, False)
+
+
 def _public_formats(info: dict[str, Any]) -> list[dict[str, Any]]:
     formats: list[dict[str, Any]] = []
     duration = info.get("duration")
@@ -148,7 +183,7 @@ def _public_formats(info: dict[str, Any]) -> list[dict[str, Any]]:
         if item.get("vcodec") in {None, "none"} and item.get("acodec") not in {None, "none"}
     ]
     best_audio = max(audio_formats, key=lambda item: item.get("abr") or item.get("tbr") or 0, default=None)
-    best_audio_size, best_audio_is_estimate = _format_size(best_audio, duration) if best_audio else (None, False)
+    best_audio_size, best_audio_is_estimate = _resolved_format_size(best_audio, duration) if best_audio else (None, False)
 
     for item in info.get("formats", []):
         if item.get("vcodec") in {None, "none"}:
@@ -159,13 +194,7 @@ def _public_formats(info: dict[str, Any]) -> list[dict[str, Any]]:
         width, height = item.get("width"), item.get("height")
         if not width or not height:
             continue
-        size, size_is_estimate = _format_size(item, duration)
         has_audio = item.get("acodec") not in {None, "none"}
-        if not has_audio and best_audio_size:
-            size = (size or 0) + best_audio_size
-            size_is_estimate = size_is_estimate or best_audio_is_estimate or not item.get("filesize")
-        if size and size > MAX_FILE_BYTES:
-            continue
         formats.append(
             {
                 "id": str(format_id),
@@ -174,10 +203,9 @@ def _public_formats(info: dict[str, Any]) -> list[dict[str, Any]]:
                 "height": height,
                 "fps": item.get("fps"),
                 "ext": item.get("ext") or "video",
-                "filesize": size,
-                "filesize_estimated": size_is_estimate,
                 "has_audio": has_audio,
                 "orientation": "portrait" if height > width else "landscape",
+                "source": item,
             }
         )
 
@@ -188,7 +216,19 @@ def _public_formats(info: dict[str, Any]) -> list[dict[str, Any]]:
         existing = preferred.get(key)
         if existing is None or (item["has_audio"] and not existing["has_audio"]):
             preferred[key] = item
-    return sorted(preferred.values(), key=lambda item: (item["height"], item["fps"] or 0), reverse=True)
+    public_formats: list[dict[str, Any]] = []
+    for item in preferred.values():
+        size, size_is_estimate = _resolved_format_size(item["source"], duration)
+        if not item["has_audio"] and size is not None and best_audio_size:
+            size += best_audio_size
+            size_is_estimate = size_is_estimate or best_audio_is_estimate
+        if size and size > MAX_FILE_BYTES:
+            continue
+        item["filesize"] = size
+        item["filesize_estimated"] = size_is_estimate
+        item.pop("source")
+        public_formats.append(item)
+    return sorted(public_formats, key=lambda item: (item["height"], item["fps"] or 0), reverse=True)
 
 
 def _inspect(url: str) -> dict[str, Any]:
