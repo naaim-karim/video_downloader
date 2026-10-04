@@ -1,0 +1,204 @@
+"""Small HTTP API for inspecting and downloading publicly available videos."""
+
+from __future__ import annotations
+
+import asyncio
+import ipaddress
+import logging
+import os
+import re
+import shutil
+import socket
+import tempfile
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+import yt_dlp
+from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, HttpUrl
+
+MAX_FILE_BYTES = 500 * 1024 * 1024
+MAX_URL_LENGTH = 2_000
+VIDEO_EXTENSIONS = {".mp4", ".webm", ".mkv", ".mov", ".m4v", ".avi"}
+SAFE_FILENAME = re.compile(r"[^A-Za-z0-9._ -]+")
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="Video Downloader API", version="0.1.0")
+
+allowed_origins = [
+    value.strip()
+    for value in os.getenv("FRONTEND_ORIGINS", "http://localhost:8788").split(",")
+    if value.strip()
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
+)
+
+
+class VideoRequest(BaseModel):
+    url: HttpUrl
+
+
+def _is_public_url(value: str) -> bool:
+    """Reject local and private destinations before handing a URL to yt-dlp."""
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return False
+
+    hostname = parsed.hostname.rstrip(".")
+    if hostname.lower() in {"localhost", "localhost.localdomain"}:
+        return False
+
+    try:
+        addresses = {entry[4][0] for entry in socket.getaddrinfo(hostname, None)}
+    except socket.gaierror:
+        # Let yt-dlp report a useful error for unavailable public hosts.
+        return True
+
+    for address in addresses:
+        ip = ipaddress.ip_address(address)
+        if not ip.is_global:
+            return False
+    return True
+
+
+def _validate_url(url: str) -> None:
+    if len(url) > MAX_URL_LENGTH or not _is_public_url(url):
+        raise HTTPException(status_code=400, detail="Enter a public HTTP or HTTPS video URL.")
+
+
+def _ydl_options() -> dict[str, Any]:
+    return {
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "noplaylist": True,
+        "socket_timeout": 20,
+        "retries": 2,
+        "extractor_retries": 2,
+    }
+
+
+def _extract_info(url: str) -> dict[str, Any]:
+    with yt_dlp.YoutubeDL(_ydl_options()) as ydl:
+        return ydl.extract_info(url, download=False)
+
+
+def _public_formats(info: dict[str, Any]) -> list[dict[str, Any]]:
+    formats: list[dict[str, Any]] = []
+    for item in info.get("formats", []):
+        if item.get("vcodec") in {None, "none"}:
+            continue
+        format_id = item.get("format_id")
+        if not format_id:
+            continue
+        width, height = item.get("width"), item.get("height")
+        if not width or not height:
+            continue
+        size = item.get("filesize") or item.get("filesize_approx")
+        if size and size > MAX_FILE_BYTES:
+            continue
+        formats.append(
+            {
+                "id": str(format_id),
+                "label": item.get("format_note") or f"{height}p",
+                "width": width,
+                "height": height,
+                "fps": item.get("fps"),
+                "ext": item.get("ext") or "video",
+                "filesize": size,
+                "has_audio": item.get("acodec") not in {None, "none"},
+                "orientation": "portrait" if height > width else "landscape",
+            }
+        )
+
+    # Show one choice per stream size, preferring a format that includes audio.
+    preferred: dict[tuple[int, int, int | None], dict[str, Any]] = {}
+    for item in formats:
+        key = (item["width"], item["height"], item["fps"])
+        existing = preferred.get(key)
+        if existing is None or (item["has_audio"] and not existing["has_audio"]):
+            preferred[key] = item
+    return sorted(preferred.values(), key=lambda item: (item["height"], item["fps"] or 0), reverse=True)
+
+
+def _inspect(url: str) -> dict[str, Any]:
+    info = _extract_info(url)
+    if info.get("_type") == "playlist":
+        raise ValueError("Playlists are not supported. Paste a single video URL.")
+    formats = _public_formats(info)
+    if not formats:
+        raise ValueError("No downloadable video formats were found for this URL.")
+    return {
+        "title": info.get("title") or "Untitled video",
+        "thumbnail": info.get("thumbnail"),
+        "duration": info.get("duration"),
+        "formats": formats,
+    }
+
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.post("/api/inspect")
+async def inspect_video(request: VideoRequest) -> dict[str, Any]:
+    url = str(request.url)
+    _validate_url(url)
+    try:
+        return await asyncio.to_thread(_inspect, url)
+    except HTTPException:
+        raise
+    except Exception as error:
+        logger.exception("Video inspection failed")
+        raise HTTPException(status_code=422, detail="Could not inspect this video. It may be unavailable or unsupported.") from error
+
+
+def _download(url: str, format_id: str, directory: str) -> tuple[Path, str]:
+    info = _extract_info(url)
+    available_ids = {str(item.get("format_id")) for item in info.get("formats", [])}
+    if format_id not in available_ids:
+        raise ValueError("This format is no longer available. Inspect the video again.")
+
+    options = {
+        **_ydl_options(),
+        "format": f"{format_id}+bestaudio/{format_id}",
+        "outtmpl": str(Path(directory) / "video.%(ext)s"),
+        "merge_output_format": "mp4",
+        "max_filesize": MAX_FILE_BYTES,
+        "restrictfilenames": True,
+    }
+    with yt_dlp.YoutubeDL(options) as ydl:
+        ydl.download([url])
+
+    files = [file for file in Path(directory).iterdir() if file.suffix.lower() in VIDEO_EXTENSIONS]
+    if not files:
+        raise ValueError("The video could not be prepared for download.")
+    file = max(files, key=lambda item: item.stat().st_size)
+    if file.stat().st_size > MAX_FILE_BYTES:
+        raise ValueError("This video exceeds the 500 MB limit.")
+    title = SAFE_FILENAME.sub("", info.get("title") or "video").strip(" .") or "video"
+    return file, f"{title[:120]}{file.suffix.lower()}"
+
+
+@app.get("/api/download")
+async def download_video(url: HttpUrl, format_id: str, background_tasks: BackgroundTasks) -> FileResponse:
+    url = str(url)
+    _validate_url(url)
+    directory = tempfile.mkdtemp(prefix="video-download-")
+    try:
+        file, filename = await asyncio.to_thread(_download, url, format_id, directory)
+    except Exception as error:
+        shutil.rmtree(directory, ignore_errors=True)
+        logger.exception("Video download failed")
+        raise HTTPException(status_code=422, detail="Could not download this format. Please choose another one.") from error
+
+    background_tasks.add_task(shutil.rmtree, directory, True)
+    return FileResponse(file, media_type="application/octet-stream", filename=filename, background=background_tasks)

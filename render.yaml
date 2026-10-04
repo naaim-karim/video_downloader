@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: video-downloader-api
+    runtime: docker
+    plan: free
+    rootDir: backend
+    healthCheckPath: /health
+    envVars:
+      - key: FRONTEND_ORIGINS
+        sync: false

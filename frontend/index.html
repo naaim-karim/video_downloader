@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="Download a video from a supported public URL." />
+    <title>Video Downloader</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="page">
+      <section class="card">
+        <h1>Video Downloader</h1>
+        <p class="intro">Paste a public video URL, select a quality, and download it.</p>
+
+        <form id="inspect-form" novalidate>
+          <label for="video-url">Video URL</label>
+          <div class="url-row">
+            <input id="video-url" name="url" type="url" placeholder="https://www.youtube.com/watch?v=..." required />
+            <button id="inspect-button" type="submit">Find video</button>
+          </div>
+        </form>
+
+        <p id="message" class="message" aria-live="polite"></p>
+        <section id="result" class="result" hidden>
+          <div class="video-summary">
+            <img id="thumbnail" alt="" hidden />
+            <div>
+              <h2 id="title"></h2>
+              <p id="details" class="details"></p>
+            </div>
+          </div>
+          <div id="formats" class="formats" aria-label="Available download formats"></div>
+        </section>
+
+        <p class="notice">Download only videos you own or have permission to save.</p>
+      </section>
+    </main>
+    <script src="config.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>
